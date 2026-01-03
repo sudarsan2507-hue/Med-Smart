@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:medsmart/services/auth_services.dart';
 import 'package:medsmart/services/firestore_service.dart';
@@ -10,6 +11,11 @@ import 'package:medsmart/screens/elder_detail_screen.dart';
 import 'package:medsmart/screens/log_vitals_screen.dart';
 import 'package:medsmart/models/doctor_model.dart';
 import 'package:medsmart/models/vital_model.dart';
+import 'package:medsmart/models/alert_model.dart';
+import 'package:medsmart/services/alert_service.dart';
+import 'package:medsmart/services/notification_service.dart';
+import 'package:medsmart/services/n8n_service.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'link_elder_screen.dart';
 import 'link_patient_screen.dart';
 
@@ -110,20 +116,25 @@ class DoctorDashboard extends StatelessWidget {
                               itemCount: patients.length,
                               itemBuilder: (context, index) {
                                 final patient = patients[index];
-                                return Card(
-                                  margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                                  child: ListTile(
-                                    leading: const CircleAvatar(child: Icon(Icons.person)),
-                                    title: Text(patient.name, style: const TextStyle(fontWeight: FontWeight.bold)),
-                                    subtitle: Text("Age: ${patient.age} | ${patient.bloodType}"),
-                                    trailing: const Icon(Icons.arrow_forward_ios, size: 16),
-                                    onTap: () {
-                                      Navigator.push(
-                                        context,
-                                        MaterialPageRoute(builder: (_) => ElderDetailScreen(elder: patient)),
-                                      );
-                                    },
-                                  ),
+                                return Column(
+                                  children: [
+                                    _ElderAlertBanner(fs: fs, elderId: patient.uid),
+                                    Card(
+                                      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                                      child: ListTile(
+                                        leading: const CircleAvatar(child: Icon(Icons.person)),
+                                        title: Text(patient.name, style: const TextStyle(fontWeight: FontWeight.bold)),
+                                        subtitle: Text("Age: ${patient.age} | ${patient.bloodType}"),
+                                        trailing: const Icon(Icons.arrow_forward_ios, size: 16),
+                                        onTap: () {
+                                          Navigator.push(
+                                            context,
+                                            MaterialPageRoute(builder: (_) => ElderDetailScreen(elder: patient)),
+                                          );
+                                        },
+                                      ),
+                                    ),
+                                  ],
                                 );
                               },
                             ),
@@ -196,19 +207,78 @@ class DoctorDashboard extends StatelessWidget {
 // ... ElderDashboard and CaregiverDashboard (keep existing implementations)
 
 
-class ElderDashboard extends StatelessWidget {
+class ElderDashboard extends StatefulWidget {
   const ElderDashboard({super.key});
+
+  @override
+  State<ElderDashboard> createState() => _ElderDashboardState();
+}
+
+class _ElderDashboardState extends State<ElderDashboard> {
+  final AlertService _alertService = AlertService();
+  final N8nService _n8n = N8nService();
+  bool _monitoringStarted = false;
+  final Set<String> _notifiedReminders = {};
+
+  @override
+  void dispose() {
+    _alertService.stopMonitoring();
+    super.dispose();
+  }
+
+  void _scheduleReminders(List<MedicationModel> meds) {
+    final ns = NotificationService();
+    // In a real app, you'd be more selective, but for demo:
+    for (var med in meds) {
+      for (var time in med.frequency) {
+        try {
+          final parts = time.split(':');
+          final hour = int.parse(parts[0]);
+          final minute = int.parse(parts[1]);
+          final now = DateTime.now();
+          var scheduledDate = DateTime(now.year, now.month, now.day, hour, minute);
+          if (scheduledDate.isBefore(now)) {
+            scheduledDate = scheduledDate.add(const Duration(days: 1));
+          }
+          
+          ns.scheduleNotification(
+            id: med.id.hashCode + time.hashCode,
+            title: "Medication Reminder: ${med.name}",
+            body: "Time to take ${med.dosage}. ${med.instructions}",
+            scheduledDate: scheduledDate,
+          );
+
+          // Notify n8n (once per session per medication per time)
+          final reminderId = "${med.id}_$time";
+          if (!_notifiedReminders.contains(reminderId)) {
+            _notifiedReminders.add(reminderId);
+            _n8n.sendMedicationReminder(
+              medicationName: med.name,
+              elderName: "Elder", // Simplified for demo
+              time: time,
+            );
+          }
+        } catch (e) {
+          debugPrint("Error scheduling for ${med.name}: $e");
+        }
+      }
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     final user = AuthService().currentUser;
     final fs = FirestoreService();
 
+    if (!_monitoringStarted && user != null) {
+      _alertService.startVitalsMonitoring(user.uid);
+      _monitoringStarted = true;
+    }
+
     return StreamBuilder<ElderModel>(
       stream: fs.getElderStream(user!.uid),
       builder: (context, elderSnapshot) {
         if (elderSnapshot.hasError) {
-          // If no elder profile exists yet, show a welcome/initial configuration button
           return _buildInitialSetup(context, user.uid, user.displayName ?? "User", user.email ?? "");
         }
         if (!elderSnapshot.hasData) return const Scaffold(body: Center(child: CircularProgressIndicator()));
@@ -232,6 +302,7 @@ class ElderDashboard extends StatelessWidget {
           body: Column(
             children: [
               _buildHeader(elder),
+              _ElderAlertBanner(fs: fs, elderId: elder.uid),
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                 child: Row(
@@ -256,6 +327,9 @@ class ElderDashboard extends StatelessWidget {
                   builder: (context, medsSnapshot) {
                     if (!medsSnapshot.hasData) return const Center(child: CircularProgressIndicator());
                     final meds = medsSnapshot.data!;
+
+                    // Schedule reminders whenever meds list changes
+                    _scheduleReminders(meds);
 
                     return ListView(
                       children: [
@@ -401,8 +475,56 @@ class ElderDashboard extends StatelessWidget {
   }
 }
 
-class CaregiverDashboard extends StatelessWidget {
+class CaregiverDashboard extends StatefulWidget {
   const CaregiverDashboard({super.key});
+
+  @override
+  State<CaregiverDashboard> createState() => _CaregiverDashboardState();
+}
+
+class _CaregiverDashboardState extends State<CaregiverDashboard> {
+  final List<StreamSubscription> _alertSubscriptions = [];
+  final Set<String> _notifiedAlertIds = {};
+  List<String>? _lastElderIds;
+
+  void _startMonitoringElders(List<String> elderIds) {
+    if (elderIds.isEmpty || _lastElderIds != null && _lastElderIds!.length == elderIds.length && _lastElderIds!.every((id) => elderIds.contains(id))) {
+      return;
+    }
+    _lastElderIds = List.from(elderIds);
+    
+    for (var sub in _alertSubscriptions) {
+      sub.cancel();
+    }
+    _alertSubscriptions.clear();
+
+    final fs = FirestoreService();
+    final ns = NotificationService();
+
+    for (var id in elderIds) {
+      final sub = fs.getActiveAlerts(id).listen((alerts) {
+        if (alerts.isNotEmpty) {
+          final topAlert = alerts.first;
+          if (!_notifiedAlertIds.contains(topAlert.id)) {
+            _notifiedAlertIds.add(topAlert.id);
+            ns.showNotification(
+              title: "🚨 Alert from Elder!",
+              body: topAlert.message,
+            );
+          }
+        }
+      });
+      _alertSubscriptions.add(sub);
+    }
+  }
+
+  @override
+  void dispose() {
+    for (var sub in _alertSubscriptions) {
+      sub.cancel();
+    }
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -424,6 +546,9 @@ class CaregiverDashboard extends StatelessWidget {
 
           final caregiver = caregiverSnapshot.data!;
           final elderIds = caregiver.linkedElderIds;
+
+          // Start monitoring if not already or if list changed
+          _startMonitoringElders(elderIds);
 
           if (elderIds.isEmpty) {
             return _buildEmptyState(context);
@@ -460,20 +585,25 @@ class CaregiverDashboard extends StatelessWidget {
                       itemCount: elders.length,
                       itemBuilder: (context, index) {
                         final elder = elders[index];
-                        return Card(
-                          margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                          child: ListTile(
-                            leading: const CircleAvatar(child: Icon(Icons.person)),
-                            title: Text(elder.name, style: const TextStyle(fontWeight: FontWeight.bold)),
-                            subtitle: Text("Email: ${elder.email}"),
-                            trailing: const Icon(Icons.arrow_forward_ios, size: 16),
-                            onTap: () {
-                              Navigator.push(
-                                context,
-                                MaterialPageRoute(builder: (_) => ElderDetailScreen(elder: elder)),
-                              );
-                            },
-                          ),
+                        return Column(
+                          children: [
+                            _ElderAlertBanner(fs: fs, elderId: elder.uid),
+                            Card(
+                              margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                              child: ListTile(
+                                leading: const CircleAvatar(child: Icon(Icons.person)),
+                                title: Text(elder.name, style: const TextStyle(fontWeight: FontWeight.bold)),
+                                subtitle: Text("Email: ${elder.email}"),
+                                trailing: const Icon(Icons.arrow_forward_ios, size: 16),
+                                onTap: () {
+                                  Navigator.push(
+                                    context,
+                                    MaterialPageRoute(builder: (_) => ElderDetailScreen(elder: elder)),
+                                  );
+                                },
+                              ),
+                            ),
+                          ],
                         );
                       },
                     ),
@@ -504,6 +634,104 @@ class CaregiverDashboard extends StatelessWidget {
             icon: const Icon(Icons.add), 
             label: const Text("Link Your First Elder")
           ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ElderAlertBanner extends StatelessWidget {
+  final FirestoreService fs;
+  final String elderId;
+
+  const _ElderAlertBanner({required this.fs, required this.elderId});
+
+  Future<void> _launchUrl(String url) async {
+    if (!await launchUrl(Uri.parse(url))) {
+      debugPrint('Could not launch $url');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<List<AlertModel>>(
+      stream: fs.getActiveAlerts(elderId),
+      builder: (context, snapshot) {
+        if (!snapshot.hasData || snapshot.data!.isEmpty) return const SizedBox.shrink();
+        final alerts = snapshot.data!;
+        final mainAlert = alerts.first;
+
+        return Container(
+          margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: Colors.red.shade50,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: Colors.red.shade200, width: 2),
+            boxShadow: [BoxShadow(color: Colors.red.withOpacity(0.1), blurRadius: 4, offset: const Offset(0, 2))],
+          ),
+          child: Column(
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.warning_amber_rounded, color: Colors.red, size: 24),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text("CRITICAL HEALTH ALERT", 
+                          style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold, fontSize: 14)),
+                        Text(mainAlert.message, 
+                          style: TextStyle(color: Colors.red.shade900, fontSize: 13)),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              const Divider(height: 20),
+              // Quick Contact Actions
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceAround,
+                children: [
+                  _actionButton(
+                    icon: Icons.call, 
+                    label: "Call Help", 
+                    color: Colors.green,
+                    onTap: () => _launchUrl("tel:911"), // Demo emergency number
+                  ),
+                  _actionButton(
+                    icon: Icons.message, 
+                    label: "SMS Caregiver", 
+                    color: Colors.blue,
+                    onTap: () => _launchUrl("sms:?body=Emergency! I have a health alert: ${mainAlert.message}"),
+                  ),
+                  _actionButton(
+                    icon: Icons.email, 
+                    label: "Email Alert", 
+                    color: Colors.orange,
+                    onTap: () => _launchUrl("mailto:?subject=MedSmart Alert&body=Critical health alert detected: ${mainAlert.message}"),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _actionButton({required IconData icon, required String label, required Color color, required VoidCallback onTap}) {
+    return InkWell(
+      onTap: onTap,
+      child: Column(
+        children: [
+          CircleAvatar(
+            backgroundColor: color.withOpacity(0.1),
+            child: Icon(icon, color: color, size: 20),
+          ),
+          const SizedBox(height: 4),
+          Text(label, style: TextStyle(fontSize: 10, color: color, fontWeight: FontWeight.bold)),
         ],
       ),
     );

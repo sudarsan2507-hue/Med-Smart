@@ -3,48 +3,9 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
     
-    // Helper function to check if user is signed in
-    function isAuthenticated() {
-      return request.auth != null;
-    }
-
-    // Helper to check if user is accessing their own data
-    function isOwner(userId) {
-      return request.auth.uid == userId;
-    }
-
-    // -----------------
-    // USERS COLLECTION
-    // -----------------
-    match /users/{userId} {
-      // Users can read/write their own profile
-      allow read, write: if isOwner(userId);
-    }
-
-    // -----------------
-    // ELDERS COLLECTION
-    // -----------------
-    // For now, allow auth users to create/read. 
-    // TODO: Level 4 - Restrict to specific caregivers & the elder themselves
-    match /elders/{elderId} {
-      allow read, write: if isAuthenticated();
-    }
-
-    // -----------------
-    // MEDICAL DATA (Meds, Vitals, Alerts)
-    // -----------------
-    // Allow access if logged in.
-    // TODO: Level 4 - refine this to only allow Caregivers of the specific Elder
-    match /medications/{docId} {
-      allow read, write: if isAuthenticated();
-    }
-    
-    match /vitals/{docId} {
-      allow read, write: if isAuthenticated();
-    }
-    
-    match /alerts/{docId} {
-      allow read, write: if isAuthenticated();
+    // broad rule for development - allow auth users all access
+    match /{document=**} {
+      allow read, write: if request.auth != null;
     }
   }
 }

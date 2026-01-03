@@ -8,11 +8,15 @@ import 'firebase_options.dart';
 import 'screens/login_screen.dart';
 import 'screens/register_screen.dart';
 import 'screens/test_database_screen.dart';
+import 'services/notification_service.dart';
 
 Future<void> main() async {
   try {
     WidgetsFlutterBinding.ensureInitialized();
     await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+    
+    // Initialize Notifications
+    await NotificationService().init();
     
     // Disable persistence on Web safely if needed later
     // For now, let's get the app running first.
